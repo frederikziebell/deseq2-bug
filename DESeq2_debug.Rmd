@@ -1,0 +1,134 @@
+# Preparations
+```{r}
+# packages
+library("tidyverse")
+library("Rcpp")
+library("DESeq2")
+
+# DESeq2 internal code
+source("https://raw.githubusercontent.com/mikelove/DESeq2/master/R/core.R")
+source("https://raw.githubusercontent.com/mikelove/DESeq2/master/R/fitNbinomGLMs.R")
+source("https://raw.githubusercontent.com/mikelove/DESeq2/master/R/results.R")
+source("https://raw.githubusercontent.com/mikelove/DESeq2/master/R/wrappers.R")
+sourceCpp(code=read_file("https://raw.githubusercontent.com/mikelove/DESeq2/master/src/DESeq2.cpp"))
+
+# load a gene
+exp_design <- readRDS("exp_design.rds")
+gene_counts <- readRDS("gene_counts.rds")
+size_factors <- readRDS("size_factors.rds")
+dds <- DESeqDataSetFromMatrix(gene_counts, exp_design, ~condition+run)
+sizeFactors(dds) <- size_factors
+```
+
+# Exploration
+```{r}
+paste0("The loaded gene has ", dim(dds)[2],
+       " samples, assayed in ", dds$condition %>% unique %>% length,
+       " conditions and ", dds$run %>% unique %>% length, " runs.")
+```
+
+# Observation
+The loaded genes has a very high dispersion estimate, compared to the one expected from a linear-quadratic mean-variance relationship.
+```{r}
+# dispersion from linear-quadratic mean-variance relation
+gene_mean <- mean(counts(dds, normalized=TRUE)[1,])
+gene_var <- var(counts(dds, normalized=TRUE)[1,])
+(gene_var - gene_mean) / gene_mean^2
+
+# estimated dispersion
+estimateDispersionsGeneEst(dds) %>%
+  rowData %>%
+  .$dispGeneEst
+```
+
+# Looking into estimateDispersionsGeneEst
+```{r}
+# load data
+object <- dds
+
+# default function parameters
+minDisp = 1e-08
+kappa_0 = 1
+dispTol = 1e-06
+maxit = 100
+quiet = FALSE
+modelMatrix = NULL
+niter = 1
+linearMu = NULL
+minmu = 0.5
+
+# ===== original code of estimateDispersionsGeneEst() =====
+modelMatrix <- stats::model.matrix.default(design(object), data=as.data.frame(colData(object)))
+
+object <- getBaseMeansAndVariances(object)
+objectNZ <- object[!mcols(object)$allZero, , drop = FALSE]
+roughDisp <- roughDispEstimate(y = counts(objectNZ, normalized = TRUE), x = modelMatrix)
+momentsDisp <- momentsDispEstimate(objectNZ)
+alpha_hat <- pmin(roughDisp, momentsDisp)
+
+maxDisp <- max(10, ncol(object))
+alpha_hat <- alpha_hat_new <- alpha_init <- pmin(pmax(minDisp, 
+  alpha_hat), maxDisp)
+wlist <- getAndCheckWeights(object, modelMatrix)
+weights <- wlist$weights
+weights <- pmax(weights, 1e-06)
+useWeights <- wlist$useWeights
+if (is.null(linearMu)) {
+  modelMatrixGroups <- modelMatrixGroups(modelMatrix)
+  linearMu <- nlevels(modelMatrixGroups) == ncol(modelMatrix)
+  if (useWeights) {
+    linearMu <- FALSE
+  }
+}
+fitidx <- rep(TRUE, nrow(objectNZ))
+mu <- matrix(0, nrow = nrow(objectNZ), ncol = ncol(objectNZ))
+dispIter <- numeric(nrow(objectNZ))
+for (iter in seq_len(niter)) {
+  if (!linearMu) {
+    fit <- fitNbinomGLMs(objectNZ[fitidx, , drop = FALSE], 
+      alpha_hat = alpha_hat[fitidx], modelMatrix = modelMatrix)
+    fitMu <- fit$mu
+  } else {
+    fitMu <- linearModelMuNormalized(objectNZ[fitidx, 
+      , drop = FALSE], modelMatrix)
+  }
+  fitMu[fitMu < minmu] <- minmu
+  mu[fitidx, ] <- fitMu
+  dispRes <- fitDispWrapper(ySEXP = counts(objectNZ)[fitidx, 
+    , drop = FALSE], xSEXP = modelMatrix, mu_hatSEXP = fitMu, 
+    log_alphaSEXP = log(alpha_hat)[fitidx], log_alpha_prior_meanSEXP = log(alpha_hat)[fitidx], 
+    log_alpha_prior_sigmasqSEXP = 1, min_log_alphaSEXP = log(minDisp/10), 
+    kappa_0SEXP = kappa_0, tolSEXP = dispTol, maxitSEXP = maxit, 
+    usePriorSEXP = FALSE, weightsSEXP = weights, useWeightsSEXP = useWeights)
+  dispIter[fitidx] <- dispRes$iter
+  alpha_hat_new[fitidx] <- pmin(exp(dispRes$log_alpha), 
+    maxDisp)
+  fitidx <- abs(log(alpha_hat_new) - log(alpha_hat)) > 
+    0.05
+  alpha_hat <- alpha_hat_new
+  if (sum(fitidx) == 0) 
+    break
+}
+dispGeneEst <- alpha_hat
+
+print(paste0("preliminary dispGeneEst: ",alpha_hat))
+print(paste0("iterations: ",dispIter))
+
+if (niter == 1) {
+  noIncrease <- dispRes$last_lp < dispRes$initial_lp + 
+    abs(dispRes$initial_lp)/1e+06
+  dispGeneEst[which(noIncrease)] <- alpha_init[which(noIncrease)]
+}
+dispGeneEstConv <- dispIter < maxit & !(dispIter == 1)
+refitDisp <- !dispGeneEstConv & dispGeneEst > minDisp * 10
+if (sum(refitDisp) > 0) {
+  dispGrid <- fitDispGridWrapper(y = counts(objectNZ)[refitDisp, 
+    , drop = FALSE], x = modelMatrix, mu = mu[refitDisp, 
+    , drop = FALSE], logAlphaPriorMean = rep(0, sum(refitDisp)), 
+    logAlphaPriorSigmaSq = 1, usePrior = FALSE, weightsSEXP = weights[refitDisp, 
+      , drop = FALSE], useWeightsSEXP = useWeights)
+  dispGeneEst[refitDisp] <- dispGrid
+}
+
+print(paste0("dispGeneEst after refitting: ", dispGeneEst))
+```
